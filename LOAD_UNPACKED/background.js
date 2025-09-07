@@ -4,7 +4,8 @@ const COOKIE_ALARM_NAME = 'wplacer-cookie-alarm';
 
 // --- Core Functions ---
 const getSettings = async () => {
-    const result = await chrome.storage.local.get(['wplacerPort']);
+    let result = {};
+    try { result = await chrome.storage.local.get(['wplacerPort']); } catch {}
     return {
         port: result.wplacerPort || 80,
         host: '127.0.0.1'
@@ -61,30 +62,28 @@ const sendCookie = async (callback) => {
     const getCookie = (details) => new Promise(resolve => chrome.cookies.get(details, cookie => resolve(cookie)));
 
     const [jCookie, sCookie] = await Promise.all([
-        getCookie({ url: "https://backend.wplace.live", name: "j" }),
-        getCookie({ url: "https://backend.wplace.live", name: "s" })
+        getCookie({ url: 'https://backend.wplace.live', name: 'j' }),
+        getCookie({ url: 'https://backend.wplace.live', name: 's' }),
     ]);
 
-    if (!jCookie) {
-        if (callback) callback({ success: false, error: "Cookie 'j' not found. Are you logged in?" });
-        return;
-    }
+    if (!jCookie) return { success: false, error: "Cookie 'j' not found. Are you logged in?" };
 
     const cookies = { j: jCookie.value };
     if (sCookie) cookies.s = sCookie.value;
-    const url = await getServerUrl("/user");
+    const url = await getServerUrl('/user');
 
     try {
         const response = await fetch(url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ cookies, expirationDate: jCookie.expirationDate })
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies, expirationDate: jCookie.expirationDate }),
         });
         if (!response.ok) throw new Error(`Server responded with status: ${response.status}`);
+        /** @type {{ name: string; }} */
         const userInfo = await response.json();
-        if (callback) callback({ success: true, name: userInfo.name });
+        callback?.({ success: true, name: userInfo.name });
     } catch (error) {
-        if (callback) callback({ success: false, error: "Could not connect to the wplacer server." });
+        callback?.({ success: false, error: 'Could not connect to the wplacer server.' });
     }
 };
 
@@ -135,22 +134,85 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         if (window.__wplacerPawtectHooked) return;
                         window.__wplacerPawtectHooked = true;
 
-                        const backend = 'https://backend.wplace.live';
-                        const importModule = async () => {
-                            const candidates = [
-                                new URL('/_app/immutable/chunks/BBb1ALhY.js', location.origin).href,
-                                'https://wplace.live/_app/immutable/chunks/BBb1ALhY.js'
-                            ];
-                            let lastErr;
-                            for (const url of candidates) {
-                                try { return await import(url); } catch (e) { lastErr = e; }
-                            }
-                            console.warn('pawtect: module import failed', lastErr?.message || lastErr);
-                            return null;
-                        };
+                        // Find by object value, not by file name
+                        window.__wplacerPawtectModule = (async () => {
+                            /** @typedef {{ type: "function" | "class" | "variable"; instanceResult: never; found: boolean; filterFunction: (obj: unknown, modules: Record<string, unknown>) => Promise<boolean>; readonly value: unknown; globalInstance: unknown }} Hook */
 
+                            /**
+                             * Create a hook filter that will get use for find the object
+                             * @author Hao1337
+                             * @param {(this: Hook, obj: unknown, modules: Record<string, unknown>) => boolean} filterFunction - The function that use to find the request module. Can't use the function/class/variable name since it get change every time the web have rebuild. But the property name stay the same at all!
+                             * @param {"class"|"variable"|"function"} type - Value type
+                             * @returns {Hook}
+                             */
+                            function createHook(filterFunction = () => false, type = 'class') {
+                                const hookObj = {
+                                    type,
+                                    instanceResult: void 0,
+                                    found: false,
+                                    globalInstance: void 0,
+                                    /** @type {unknown} */
+                                    get value() {
+                                        if (!this.instanceResult) return void 0;
+                                        if (this.type === 'class') {
+                                            return typeof this.instanceResult === 'function'
+                                                ? this.instanceResult
+                                                : Object.getPrototypeOf(this.instanceResult);
+                                        }
+                                        return this.instanceResult;
+                                    },
+                                };
+                                hookObj.filterFunction = filterFunction.bind(hookObj);
+                                return hookObj;
+                            }
+
+                            /**
+                             * Find the script base on the hook options
+                             * @author Hao1337
+                             * @param {Hook[]} hooksInfo
+                             * @returns {Promise<unknown[]>} - The module that you want to find, module order like input hook order
+                             */
+                            async function findScriptModuleRecusive(hooksInfo = []) {
+                                const scripts = performance.getEntriesByType('resource').filter((r) => r.initiatorType === 'script');
+                                const out = Array.from({ length: hooksInfo.length }).fill(void 0);
+
+                                for (const script of scripts) {
+                                    try {
+                                        const module = await import(script.name);
+                                        const moduleAsObject = Object.entries(module);
+
+                                        for (const [exportName, exportValue] of moduleAsObject) {
+                                            for (let i = 0; i < hooksInfo.length; i++) {
+                                                const found = await hooksInfo[i].filterFunction(exportValue, moduleAsObject);
+                                                if (found && !hooksInfo[i].found) {
+                                                    hooksInfo[i].instanceResult = exportValue;
+                                                    hooksInfo[i].found = true;
+                                                    out[i] = module;
+                                                    console.log(`wplacer: Hook matched on ${exportName} from ${script.name}`, out);
+                                                }
+                                            }
+                                        }
+                                    } catch (err) {
+                                        console.warn('wplacer: Could not import', script.name, err);
+                                    }
+                                }
+
+                                return out;
+                            }
+
+                            const pawTectHook = createHook(function FindPaintFunction(obj) {
+                                if (!obj || typeof obj !== 'object') return false;
+                                return 'paint' in obj && 'url' in obj && typeof obj['paint'] === 'function';
+                            }, 'variable');
+
+                            return await findScriptModuleRecusive([pawTectHook])
+                                .then(r => r?.[0] ?? null)
+                                .catch(console.error) ?? null;
+                        })();
+
+                        const backend = 'https://backend.wplace.live';
                         const computePawtect = async (url, bodyStr) => {
-                            const mod = await importModule();
+                            const mod = typeof window.__wplacerPawtectModule === "undefined" ? null : await window.__wplacerPawtectModule;
                             if (!mod || typeof mod._ !== 'function') return null;
                             const wasm = await mod._();
                             try {
@@ -263,7 +325,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                             try {
                                 const backend = 'https://backend.wplace.live';
                                 const url = `${backend}/s0/pixel/1/1`;
-                                const mod = await import('/_app/immutable/chunks/BBb1ALhY.js');
+                                const mod = typeof window.__wplacerPawtectModule === "undefined" ? null : await window.__wplacerPawtectModule;
                                 const wasm = await mod._();
                                 try {
                                     const me = await fetch(`${backend}/me`, { credentials: 'include' }).then(r => r.ok ? r.json() : null);
@@ -309,7 +371,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         (async () => {
                             try {
                                 const backend = 'https://backend.wplace.live';
-                                const mod = await import('/_app/immutable/chunks/BBb1ALhY.js');
+                                const mod = typeof window.__wplacerPawtectModule === "undefined" ? null : await window.__wplacerPawtectModule;
                                 const wasm = await mod._();
                                 try {
                                     const me = await fetch(`${backend}/me`, { credentials: 'include' }).then(r => r.ok ? r.json() : null);

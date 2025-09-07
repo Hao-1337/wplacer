@@ -6,6 +6,7 @@
   "permissions": [
     "storage",
     "cookies",
+    "scripting",
     "tabs",
     "alarms",
     "browsingData",

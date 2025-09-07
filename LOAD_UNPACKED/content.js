@@ -34,7 +34,8 @@ const randomInt = (max) => Math.floor(Math.random() * Math.max(1, Number(max) ||
 
 // Create a per-load fingerprint and expose it for page usage
 try {
-    const fp = generateRandomHex(32);
+    // keep fingerprint stable, change it on every reload but have the same IP is suspicious
+    const fp = sessionStorage.getItem('wplacer_fp') || generateRandomHex(32);
     window.wplacerFP = fp;
     sessionStorage.setItem('wplacer_fp', fp);
     console.log('wplacer: fingerprint generated:', fp);
