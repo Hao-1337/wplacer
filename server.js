@@ -59,6 +59,8 @@ const TEMPLATES_PATH = path.join(DATA_DIR, 'templates.json');
 const JSON_LIMIT = '50mb';
 
 const MS = {
+    QUARTER_SEC: 250,
+    TWO_SEC: 2_000,
     THIRTY_SEC: 30_000,
     TWO_MIN: 120_000,
     FIVE_MIN: 300_000,
@@ -394,8 +396,16 @@ class WPlacer {
 
     async _fetch(url, options) {
         try {
-            // Add a default timeout to all requests to prevent hangs
-            const optsWithTimeout = { timeout: 30000, ...options };
+            // Add a default timeout and browser-like defaults to reduce CF challenges
+            const defaultHeaders = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                // Referer helps some CF setups; safe default for this backend
+                'Referer': 'https://wplace.live/'
+            };
+            const mergedHeaders = { ...(defaultHeaders), ...(options?.headers || {}) };
+            const optsWithTimeout = { timeout: 30000, ...options, headers: mergedHeaders };
             return await this.browser.fetch(url, optsWithTimeout);
         } catch (error) {
             if (error.code === 'InvalidArg') {
@@ -412,6 +422,8 @@ class WPlacer {
         for (const k of Object.keys(this.cookies)) {
             jar.setCookieSync(`${k}=${this.cookies[k]}; Path=/`, WPLACE_BASE);
         }
+        const sleepTime = Math.floor(Math.random() * MS.TWO_SEC) + MS.QUARTER_SEC;
+        await sleep(sleepTime);
         const opts = { cookieJar: jar, browser: 'chrome', ignoreTlsErrors: true };
         const proxyUrl = getNextProxy();
         if (proxyUrl) {
@@ -444,6 +456,15 @@ class WPlacer {
                 throw new NetworkError('(401) Unauthorized. The cookie may be invalid or the current IP/proxy is rate-limited.');
             if (userInfo.error) throw new Error(`(500) Auth failed: "${userInfo.error}".`);
             if (userInfo.id && userInfo.name) {
+                const suspendedUntil = users[userInfo.id]?.suspendedUntil; // Grab suspendedUntil property from config files
+                const isStillSuspended = suspendedUntil > new Date();
+
+                // And create a new property in UserInfo
+                userInfo["ban"] = {
+                    status: isStillSuspended,
+                    until: suspendedUntil
+                };
+
                 this.userInfo = userInfo;
                 ChargeCache.markFromUserInfo(userInfo);
                 return true;
@@ -458,7 +479,7 @@ class WPlacer {
     }
 
     async post(url, body) {
-        const headers = { Accept: '*/*', 'Content-Type': 'text/plain;charset=UTF-8', Referer: 'https://wplace.live/' };
+        const headers = { 'Content-Type': 'text/plain;charset=UTF-8' };
         if (this.pawtect) headers['x-pawtect-token'] = this.pawtect;
         const req = await this._fetch(url, {
             method: 'POST',
@@ -1191,8 +1212,19 @@ class TemplateManager {
             } catch (error) {
                 if (error.name === 'SuspensionError') {
                     const until = new Date(error.suspendedUntil).toLocaleString();
-                    log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🛑 Account suspended until ${until}.`);
-                    users[wplacer.userInfo.id].suspendedUntil = error.suspendedUntil;
+                    
+                    // Difference between a BAN and a SUSPENSION of the account.
+                    if (error.durationMs > 0) log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🛑 Account suspended until ${until}.`);
+                    else log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🛑 Account BANNED PERMANENTLY, banned due to ${error.reason}.`)
+                    
+                    /*
+                    
+                    If a BAN has been issued, instead of setting suspendedUntil to wpalcer's suspendedUntil (current date in ms),
+                    set it to a HUGE number to avoid modifying any logic in the rest of the code, and still perform properly with
+                    the banned account.
+                    
+                    */
+                    users[wplacer.userInfo.id].suspendedUntil = error.durationMs > 0 ? error.suspendedUntil : Number.MAX_SAFE_INTEGER;
                     saveUsers();
                     throw error;
                 }
@@ -1630,11 +1662,16 @@ app.post('/user', async (req, res) => {
     const wplacer = new WPlacer({});
     try {
         const userInfo = await wplacer.login(req.body.cookies);
+        let banned = users[userInfo.id]?.suspendedUntil; // Save any previous suspendedUntil property
         users[userInfo.id] = {
             name: userInfo.name,
             cookies: req.body.cookies,
             expirationDate: req.body.expirationDate,
         };
+
+        if (banned && banned > new Date())
+            users[userInfo.id].suspendedUntil = banned // Restore the suspsendedUntil property from users file if is still suspended
+
         saveUsers();
         res.json(userInfo);
     } catch (error) {
@@ -2148,7 +2185,7 @@ const diffVer = (v1, v2) => {
                 ▒▒▒▒▒                                          v${version}`));
     // check versions (dont delete this ffs)
     try {
-        const githubPackage = await fetch("https://raw.githubusercontent.com/luluwaffless/wplacer/refs/heads/main/package.json");
+        const githubPackage = await fetch("https://raw.githubusercontent.com/wplacer/wplacer/refs/heads/main/package.json");
         const githubVersion = (await githubPackage.json()).version;
         const diff = diffVer(version, githubVersion);
         if (diff !== 0) console.warn(`${diff < 0 ? "⚠️ Outdated version! Please update using \"git pull\"." : "🤖 Unreleased."}\n  GitHub: ${githubVersion}\n  Local: ${version} (${diff})`);
