@@ -141,7 +141,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                             /**
                              * Create a hook filter that will get use for find the object
                              * @author Hao1337
-                             * @param {(this: Hook, obj: unknown, modules: Record<string, unknown>) => boolean} filterFunction - The function that use to find the request module. Can't use the function/class/variable name since it get change every time the web have rebuild. But the property name stay the same at all!
+                             * @param {(this: Hook, obj: unknown, url: string; modules: Record<string, unknown>) => boolean} filterFunction - The function that use to find the request module. Can't use the function/class/variable name since it get change every time the web have rebuild. But the property name stay the same at all!
                              * @param {"class"|"variable"|"function"} type - Value type
                              * @returns {Hook}
                              */
@@ -183,7 +183,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
                                         for (const [exportName, exportValue] of moduleAsObject) {
                                             for (let i = 0; i < hooksInfo.length; i++) {
-                                                const found = await hooksInfo[i].filterFunction(exportValue, moduleAsObject);
+                                                const found = await hooksInfo[i].filterFunction(exportValue, script.name, moduleAsObject);
                                                 if (found && !hooksInfo[i].found) {
                                                     hooksInfo[i].instanceResult = exportValue;
                                                     hooksInfo[i].found = true;
@@ -201,8 +201,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                             }
 
                             const pawTectHook = createHook(function FindPaintFunction(obj) {
-                                if (!obj || typeof obj !== 'object') return false;
-                                return 'paint' in obj && 'url' in obj && typeof obj['paint'] === 'function';
+                                return /get_pawtected_endpoint_payload/.test(obj.toString());
                             }, 'variable');
 
                             return await findScriptModuleRecusive([pawTectHook])
