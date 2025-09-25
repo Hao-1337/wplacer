@@ -132,88 +132,39 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     world: 'MAIN',
                     func: () => {
                         if (window.__wplacerPawtectHooked) return;
-                        window.__wplacerPawtectHooked = true;
+                        Object.defineProperty(window, "__wplacerPawtectHooked", { value: true, writable: false });
 
                         // Find by object value, not by file name
                         window.__wplacerPawtectModule = (async () => {
-                            /** @typedef {{ type: "function" | "class" | "variable"; instanceResult: never; found: boolean; filterFunction: (obj: unknown, modules: Record<string, unknown>) => Promise<boolean>; readonly value: unknown; globalInstance: unknown }} Hook */
-
-                            /**
-                             * Create a hook filter that will get use for find the object
-                             * @author Hao1337
-                             * @param {(this: Hook, obj: unknown, url: string; modules: Record<string, unknown>) => boolean} filterFunction - The function that use to find the request module. Can't use the function/class/variable name since it get change every time the web have rebuild. But the property name stay the same at all!
-                             * @param {"class"|"variable"|"function"} type - Value type
-                             * @returns {Hook}
-                             */
-                            function createHook(filterFunction = () => false, type = 'class') {
-                                const hookObj = {
-                                    type,
-                                    instanceResult: void 0,
-                                    found: false,
-                                    globalInstance: void 0,
-                                    /** @type {unknown} */
-                                    get value() {
-                                        if (!this.instanceResult) return void 0;
-                                        if (this.type === 'class') {
-                                            return typeof this.instanceResult === 'function'
-                                                ? this.instanceResult
-                                                : Object.getPrototypeOf(this.instanceResult);
-                                        }
-                                        return this.instanceResult;
-                                    },
-                                };
-                                hookObj.filterFunction = filterFunction.bind(hookObj);
-                                return hookObj;
-                            }
-
-                            /**
-                             * Find the script base on the hook options
-                             * @author Hao1337
-                             * @param {Hook[]} hooksInfo
-                             * @returns {Promise<unknown[]>} - The module that you want to find, module order like input hook order
-                             */
-                            async function findScriptModuleRecusive(hooksInfo = []) {
-                                const scripts = performance.getEntriesByType('resource').filter((r) => r.initiatorType === 'script');
-                                const out = Array.from({ length: hooksInfo.length }).fill(void 0);
+                            try {
+                                const scripts = performance.getEntriesByType("resource")
+                                    .filter(r => r.initiatorType === "script");
 
                                 for (const script of scripts) {
                                     try {
                                         const module = await import(script.name);
-                                        const moduleAsObject = Object.entries(module);
-
-                                        for (const [exportName, exportValue] of moduleAsObject) {
-                                            for (let i = 0; i < hooksInfo.length; i++) {
-                                                const found = await hooksInfo[i].filterFunction(exportValue, script.name, moduleAsObject);
-                                                if (found && !hooksInfo[i].found) {
-                                                    hooksInfo[i].instanceResult = exportValue;
-                                                    hooksInfo[i].found = true;
-                                                    out[i] = module;
-                                                    console.log(`wplacer: Hook matched on ${exportName} from ${script.name}`, out);
-                                                }
-                                            }
+                                        if ("_" in module && typeof module._ === "function") {
+                                            const funcStr = module._.toString();
+                                            if (/get_pawtected_endpoint_payload/.test(funcStr) || /pawtect_wasm_bg\.wasm/.test(funcStr)) {
+                                                console.log("wplacer: found pawtect module in", script.name);
+                                                return module;
+                                            };
                                         }
-                                    } catch (err) {
-                                        console.warn('wplacer: Could not import', script.name, err);
+                                    } catch (e) {
+                                        console.warn("wplacer: failed to import", script.name, e);
                                     }
                                 }
-
-                                return out;
+                            } catch (err) {
+                                console.error("wplacer: module scan failed", err);
                             }
-
-                            const pawTectHook = createHook(function FindPaintFunction(obj) {
-                                return /get_pawtected_endpoint_payload/.test(obj.toString());
-                            }, 'variable');
-
-                            return await findScriptModuleRecusive([pawTectHook])
-                                .then(r => r?.[0] ?? null)
-                                .catch(console.error) ?? null;
+                            return null; // important! never leave unresolved
                         })();
 
                         const backend = 'https://backend.wplace.live';
                         const computePawtect = async (url, bodyStr) => {
                             const mod = typeof window.__wplacerPawtectModule === "undefined" ? null : await window.__wplacerPawtectModule;
                             if (!mod || typeof mod._ !== 'function') return null;
-                            const wasm = await mod._();
+                            let wasm = await mod._();
                             try {
                                 const me = await fetch(`${backend}/me`, { credentials: 'include' }).then(r => r.ok ? r.json() : null);
                                 if (me?.id && typeof mod.i === 'function') mod.i(me.id);
@@ -223,26 +174,32 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                             const dec = new TextDecoder();
                             const bytes = enc.encode(bodyStr);
                             const inPtr = wasm.__wbindgen_malloc(bytes.length, 1);
-                            new Uint8Array(wasm.memory.buffer, inPtr, bytes.length).set(bytes);
-                            console.log('wplacer: pawtect compute start', { url, bodyLen: bodyStr.length });
-                            const out = wasm.get_pawtected_endpoint_payload(inPtr, bytes.length);
-                            let token;
-                            if (Array.isArray(out)) {
-                                const [outPtr, outLen] = out;
-                                token = dec.decode(new Uint8Array(wasm.memory.buffer, outPtr, outLen));
-                                try { wasm.__wbindgen_free(outPtr, outLen, 1); } catch { }
-                            } else if (typeof out === 'string') {
-                                token = out;
-                            } else if (out && typeof out.ptr === 'number' && typeof out.len === 'number') {
-                                token = dec.decode(new Uint8Array(wasm.memory.buffer, out.ptr, out.len));
-                                try { wasm.__wbindgen_free(out.ptr, out.len, 1); } catch { }
-                            } else {
-                                console.warn('wplacer: unexpected pawtect out shape', typeof out);
-                                token = null;
+                            try {
+                                new Uint8Array(wasm.memory.buffer, inPtr, bytes.length).set(bytes);
+                                if (typeof mod.r === "function") mod.r(url);
+
+                                const out = wasm.get_pawtected_endpoint_payload(inPtr, bytes.length);
+
+                                let token = null;
+                                if (Array.isArray(out)) {
+                                    const [outPtr, outLen] = out;
+                                    token = dec.decode(new Uint8Array(wasm.memory.buffer, outPtr, outLen));
+                                    wasm.__wbindgen_free(outPtr, outLen, 1);
+                                } else if (typeof out === "string") {
+                                    token = out;
+                                } else if (out && typeof out.ptr === "number" && typeof out.len === "number") {
+                                    token = dec.decode(new Uint8Array(wasm.memory.buffer, out.ptr, out.len));
+                                    wasm.__wbindgen_free(out.ptr, out.len, 1);
+                                }
+                                window.postMessage({ type: "WPLACER_PAWTECT_TOKEN", token, origin: "pixel" }, "*");
+                                return token;
+                            } catch (err) {
+                                console.error("wplacer: computePawtect error", err);
+                                return null;
+                            } finally {
+                                try { wasm.__wbindgen_free(inPtr, bytes.length, 1); } catch {}
+                                wasm = null;
                             }
-                            console.log('wplacer: pawtect compute done, tokenLen:', token ? token.length : 0);
-                            window.postMessage({ type: 'WPLACER_PAWTECT_TOKEN', token, origin: 'pixel' }, '*');
-                            return token;
                         };
 
                         const originalFetch = window.fetch.bind(window);
@@ -325,7 +282,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                                 const backend = 'https://backend.wplace.live';
                                 const url = `${backend}/s0/pixel/1/1`;
                                 const mod = typeof window.__wplacerPawtectModule === "undefined" ? null : await window.__wplacerPawtectModule;
-                                const wasm = await mod._();
+                                if (!mod) return;
+                                let wasm = await mod._();
                                 try {
                                     const me = await fetch(`${backend}/me`, { credentials: 'include' }).then(r => r.ok ? r.json() : null);
                                     if (me?.id && typeof mod.i === 'function') mod.i(me.id);
@@ -348,6 +306,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                                     token = dec.decode(new Uint8Array(wasm.memory.buffer, out.ptr, out.len));
                                     try { wasm.__wbindgen_free(out.ptr, out.len, 1); } catch { }
                                 }
+                                try { wasm.__wbindgen_free(inPtr, bytes.length, 1); } catch {}
+                                wasm = null;
                                 window.postMessage({ type: 'WPLACER_PAWTECT_TOKEN', token, origin: 'seed' }, '*');
                             } catch { }
                         })();
@@ -371,7 +331,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                             try {
                                 const backend = 'https://backend.wplace.live';
                                 const mod = typeof window.__wplacerPawtectModule === "undefined" ? null : await window.__wplacerPawtectModule;
-                                const wasm = await mod._();
+                                if (!mod) return;
+                                let wasm = await mod._();
                                 try {
                                     const me = await fetch(`${backend}/me`, { credentials: 'include' }).then(r => r.ok ? r.json() : null);
                                     if (me?.id && typeof mod.i === 'function') mod.i(me.id);
@@ -403,6 +364,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                                     token = dec.decode(new Uint8Array(wasm.memory.buffer, out.ptr, out.len));
                                     try { wasm.__wbindgen_free(out.ptr, out.len, 1); } catch { }
                                 }
+                                try { wasm.__wbindgen_free(inPtr, bytes.length, 1); } catch {}
+                                wasm = null;
                                 window.postMessage({ type: 'WPLACER_PAWTECT_TOKEN', token, origin: 'simple' }, '*');
                             } catch { }
                         })();
