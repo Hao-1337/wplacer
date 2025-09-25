@@ -599,7 +599,7 @@ class WPlacer {
     }
 
     /** Compute pixels needing change, honoring modes. */
-    _getMismatchedPixels(currentSkip = 1, colorFilter = null) {
+    _getMismatchedPixels(currentSkip = 1, colorFilter = null, isCheck = false) {
         const [startX, startY, startPx, startPy] = this.coords;
         const out = [];
 
@@ -678,7 +678,11 @@ class WPlacer {
                 }
             }
         }
-        return out;
+
+        const ret = isCheck ? out : out.filter(c => this.hasColor(c.color));
+        if (ret.length === 0) log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] No paintable pixels found (all done or no colors unlocked).`);
+
+        return ret;
     }
 
     async paint(currentSkip = 1, colorFilter = null) {
@@ -1234,17 +1238,17 @@ class TemplateManager {
             } catch (error) {
                 if (error.name === 'SuspensionError') {
                     const until = new Date(error.suspendedUntil).toLocaleString();
-                    
+
                     // Difference between a BAN and a SUSPENSION of the account.
                     if (error.durationMs > 0) log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🛑 Account suspended until ${until}.`);
                     else log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🛑 Account BANNED PERMANENTLY, banned due to ${error.reason}.`)
-                    
+
                     /*
-                    
+
                     If a BAN has been issued, instead of setting suspendedUntil to wpalcer's suspendedUntil (current date in ms),
                     set it to a HUGE number to avoid modifying any logic in the rest of the code, and still perform properly with
                     the banned account.
-                    
+
                     */
                     users[wplacer.userInfo.id].suspendedUntil = error.durationMs > 0 ? error.suspendedUntil : Number.MAX_SAFE_INTEGER;
                     saveUsers();
@@ -1289,7 +1293,7 @@ class TemplateManager {
                 log('SYSTEM', 'wplacer', `[${this.name}] Checking template status with user ${users[userId].name}...`);
                 await wplacer.login(users[userId].cookies);
                 await wplacer.loadTiles();
-                const mismatchedPixels = wplacer._getMismatchedPixels(1, null); // Check all pixels, no skip, no color filter.
+                const mismatchedPixels = wplacer._getMismatchedPixels(1, null, true); // Check all pixels, no skip, no color filter.
                 log('SYSTEM', 'wplacer', `[${this.name}] Check complete. Found ${mismatchedPixels.length} mismatched pixels.`);
                 return { wplacer, mismatchedPixels }; // Success
             } catch (error) {
@@ -1451,7 +1455,8 @@ class TemplateManager {
                                         this.status = `Running user ${userInfo.name} | Pass (1/${this.currentPixelSkip})`;
                                         log(userInfo.id, userInfo.name, `[${this.name}] 🔋 Predicted charges: ${Math.floor(predicted.count)}/${predicted.max}.`);
 
-                                        await this._performPaintTurn(wplacer, color);
+                                        const amount = await this._performPaintTurn(wplacer, color);
+                                        if (amount === 0) continue;
 
                                         // A paint was attempted, we assume the pass is not yet complete and will re-evaluate.
                                         foundUserForTurn = true;

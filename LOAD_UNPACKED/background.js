@@ -137,6 +137,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         // Find by object value, not by file name
                         window.__wplacerPawtectModule = (async () => {
                             try {
+                                await new Promise(r => setTimeout(r, 1000)); // wait a bit for scripts to load
                                 const scripts = performance.getEntriesByType("resource")
                                     .filter(r => r.initiatorType === "script");
 
@@ -281,7 +282,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                             try {
                                 const backend = 'https://backend.wplace.live';
                                 const url = `${backend}/s0/pixel/1/1`;
-                                const mod = await import('/_app/immutable/chunks/BBb1ALhY.js');
+                                const mod = await window.__wplacerPawtectModule;
                                 const wasm = await mod._();
                                 try {
                                     const me = await fetch(`${backend}/me`, { credentials: 'include' }).then(r => r.ok ? r.json() : null);
@@ -329,7 +330,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         (async () => {
                             try {
                                 const backend = 'https://backend.wplace.live';
-                                const mod = await import('/_app/immutable/chunks/BBb1ALhY.js');
+                                const mod = await window.__wplacerPawtectModule;
                                 const wasm = await mod._();
                                 try {
                                     const me = await fetch(`${backend}/me`, { credentials: 'include' }).then(r => r.ok ? r.json() : null);
