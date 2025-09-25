@@ -84,7 +84,7 @@ const logsTypeFilter = $('logsTypeFilter');
 
 // --- Global State ---
 let templateUpdateInterval = null;
-let confirmCallback = null;
+let confirmCallback = {};
 let currentTab = 'main';
 let currentTemplate = { width: 0, height: 0, data: [] };
 
@@ -94,6 +94,18 @@ let logsMode = 'logs'; // 'logs' or 'errors'
 let allLogLines = [];
 let filterText = '';
 let filterType = '';
+// Cap log buffer to N lines to keep UI responsive.
+const MAX_LOG_LINES = 2000;
+let __logRenderScheduled = false;
+// Throttle log rendering to avoid UI jank under high throughput.
+function renderLogsSoon() {
+    if (__logRenderScheduled) return;
+    __logRenderScheduled = true;
+    setTimeout(() => {
+        __logRenderScheduled = false;
+        renderFilteredLogs();
+    }, 100);
+}
 
 const tabs = {
     main,
@@ -104,45 +116,80 @@ const tabs = {
     logsViewer,
 };
 
+// Lightweight axios fallback using fetch, in case CDN fails to load axios
+(() => {
+    if (window.axios) return;
+    const buildUrl = (url, params) => {
+        if (!params) return url;
+        const usp = new URLSearchParams(params);
+        return url + (url.includes('?') ? '&' : '?') + usp.toString();
+    };
+    const request = async (method, url, { params, data, headers } = {}) => {
+        const u = buildUrl(url, params);
+        const init = { method, headers: { 'Content-Type': 'application/json', ...(headers || {}) } };
+        if (data !== undefined) init.body = JSON.stringify(data);
+        const res = await fetch(u, init);
+        let body = null;
+        try { body = await res.json(); } catch { body = null; }
+        if (!res.ok) {
+            const err = new Error(`HTTP ${res.status}`);
+            err.response = { status: res.status, data: body };
+            throw err;
+        }
+        return { status: res.status, data: body };
+    };
+    window.axios = {
+        get: (url, config) => request('GET', url, config),
+        delete: (url, config) => request('DELETE', url, config),
+        post: (url, data, config) => request('POST', url, { ...(config || {}), data }),
+        put: (url, data, config) => request('PUT', url, { ...(config || {}), data }),
+    };
+})();
+
 const showMessage = (title, content) => {
     messageBoxTitle.innerHTML = title;
     messageBoxContent.innerHTML = content;
     messageBoxCancel.classList.add('hidden');
     messageBoxConfirm.textContent = 'OK';
     messageBoxOverlay.classList.remove('hidden');
-    confirmCallback = null;
+    confirmCallback = { close: true };
 };
 
-const showConfirmation = (title, content, onConfirm) => {
+const showConfirmation = (title, content, onConfirm, closeOnConfirm) => {
     messageBoxTitle.innerHTML = title;
     messageBoxContent.innerHTML = content;
     messageBoxCancel.classList.remove('hidden');
     messageBoxConfirm.textContent = 'Confirm';
     messageBoxOverlay.classList.remove('hidden');
-    confirmCallback = onConfirm;
+    confirmCallback = {
+        fn: onConfirm,
+        close: closeOnConfirm
+    };
 };
 
 const closeMessageBox = () => {
     messageBoxOverlay.classList.add('hidden');
-    confirmCallback = null;
 };
 
 messageBoxConfirm.addEventListener('click', () => {
-    if (confirmCallback) {
-        confirmCallback();
-    }
-    closeMessageBox();
+    if (!confirmCallback) return;
+    const { fn: callback, close } = confirmCallback;
+    if (close) closeMessageBox();
+    if (callback) callback();
 });
 
 messageBoxCancel.addEventListener('click', () => {
     closeMessageBox();
+    confirmCallback = {};
 });
 
 const handleError = (error) => {
     console.error(error);
     let message = 'An unknown error occurred. Check the console for details.';
 
-    if (error.code === 'ERR_NETWORK') {
+    if (error?.response && error.response.status === 409) {
+        message = 'User is busy or not found. Wait a few seconds and try again, or stop templates using this user.';
+    } else if (error.code === 'ERR_NETWORK') {
         message = 'Could not connect to the server. Please ensure the bot is running and accessible.';
     } else if (error.response && error.response.data && error.response.data.error) {
         const errMsg = error.response.data.error;
@@ -209,13 +256,16 @@ function connectLogsWs() {
         try {
             const data = JSON.parse(event.data);
             if (Array.isArray(data.initial)) {
-                allLogLines = data.initial;
-                renderFilteredLogs();
+                allLogLines = data.initial.slice(-MAX_LOG_LINES);
+                renderLogsSoon();
                 return;
             }
         } catch {}
         allLogLines.push(event.data);
-        renderFilteredLogs();
+        if (allLogLines.length > MAX_LOG_LINES) {
+            allLogLines.splice(0, allLogLines.length - MAX_LOG_LINES);
+        }
+        renderLogsSoon();
     };
     logsWs.onerror = () => {
         logsContainer.innerHTML = '<span class="logs-placeholder">WebSocket error. Try refreshing.</span>';
@@ -320,19 +370,34 @@ showErrorsBtn.addEventListener('click', () => {
     connectLogsWs();
 });
 clearLogsBtn.addEventListener('click', () => {
+    allLogLines = [];
     logsContainer.innerHTML = '';
 });
 
 // --- Logs search/filter/export ---
-if (typeof logsSearchInput !== 'undefined' && logsSearchInput) {
-    logsSearchInput.addEventListener('input', (e) => {
-        filterText = e.target.value;
-        renderFilteredLogs();
-    });
-}
 
 
 // users
+async function axiosGetWithRetry(url, attempts = 3, delayMs = 2000) {
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
+        try {
+            return await axios.get(url);
+        } catch (err) {
+            const status = err?.response?.status;
+            // Retry on 409 (busy) and 429 (rate limit)
+            if (status === 409 || status === 429) {
+                lastErr = err;
+                if (i < attempts - 1) {
+                    await new Promise((r) => setTimeout(r, delayMs));
+                    continue;
+                }
+            }
+            throw err;
+        }
+    }
+    throw lastErr;
+}
 const loadUsers = async (f) => {
     try {
         const users = await axios.get('/users');
@@ -443,16 +508,58 @@ const colors = {
     '205,197,158': { id: 63, name: 'Cream' },
 };
 
+// --- Palette caches for performance ---
+const ID_TO_RGB = new Map(); // id -> [r,g,b]
+let PALETTE_ENTRIES = []; // {r,g,b,id,rgbStr}
+const closestCache = new Map(); // 'r,g,b' -> nearest 'r,g,b'
+
+function buildPaletteCaches() {
+    ID_TO_RGB.clear();
+    PALETTE_ENTRIES = [];
+    for (const [rgbStr, info] of Object.entries(colors)) {
+        const [r, g, b] = rgbStr.split(',').map(Number);
+        PALETTE_ENTRIES.push({ r, g, b, id: info.id, rgbStr });
+        ID_TO_RGB.set(info.id, [r, g, b]);
+    }
+    closestCache.clear();
+}
+
+async function syncPalette() {
+    try {
+        const r = await fetch('/palette');
+        if (!r.ok) return;
+        const data = await r.json();
+        if (data && Array.isArray(data.colors)) {
+            const merged = {};
+            for (const c of data.colors) {
+                if (!c || typeof c.rgb !== 'string' || !Number.isInteger(c.id)) continue;
+                merged[c.rgb] = { id: c.id, name: c.name || (colors[c.rgb]?.name || `Color ${c.id}`) };
+            }
+            Object.assign(colors, merged);
+            buildPaletteCaches();
+        }
+    } catch (e) {
+        console.debug('palette sync skipped:', e?.message || e);
+    }
+}
+
+buildPaletteCaches();
+syncPalette();
+
 const colorById = (id) => Object.keys(colors).find((key) => colors[key].id === id);
 const closest = (color) => {
+    const cached = closestCache.get(color);
+    if (cached) return cached;
     const [tr, tg, tb] = color.split(',').map(Number);
-    return Object.keys(colors).reduce((closestKey, currentKey) => {
-        const [cr, cg, cb] = currentKey.split(',').map(Number);
-        const [clR, clG, clB] = closestKey.split(',').map(Number);
-        const currentDistance = Math.pow(tr - cr, 2) + Math.pow(tg - cg, 2) + Math.pow(tb - cb, 2);
-        const closestDistance = Math.pow(tr - clR, 2) + Math.pow(tg - clG, 2) + Math.pow(tb - clB, 2);
-        return currentDistance < closestDistance ? currentKey : closestKey;
-    });
+    let bestKey = PALETTE_ENTRIES.length ? PALETTE_ENTRIES[0].rgbStr : color;
+    let best = Infinity;
+    for (const p of PALETTE_ENTRIES) {
+        const dr = tr - p.r, dg = tg - p.g, db = tb - p.b;
+        const d = dr * dr + dg * dg + db * db;
+        if (d < best) { best = d; bestKey = p.rgbStr; }
+    }
+    closestCache.set(color, bestKey);
+    return bestKey;
 };
 
 const drawTemplate = (template, canvas) => {
@@ -479,14 +586,9 @@ const drawTemplate = (template, canvas) => {
                 continue;
             }
 
-            const key = Object.keys(colors).find((k) => colors[k].id === color);
-            if (!key) {
-                // Unknown color id. Skip to avoid `.split` crash.
-                // Optional: console.warn('Unknown color id:', color);
-                continue;
-            }
-
-            const [r, g, b] = key.split(',').map(Number);
+            const rgbArr = ID_TO_RGB.get(color);
+            if (!rgbArr) continue;
+            const [r, g, b] = rgbArr;
             imageData.data[i] = r;
             imageData.data[i + 1] = g;
             imageData.data[i + 2] = b;
@@ -530,9 +632,12 @@ const fetchCanvas = async (txVal, tyVal, pxVal, pyVal, width, height) => {
     for (let txi = startTileX; txi <= endTileX; txi++) {
         for (let tyi = startTileY; tyi <= endTileY; tyi++) {
             try {
-                const response = await axios.get('/canvas', { params: { tx: txi, ty: tyi } });
+                const res = await fetch(`/canvas?tx=${txi}&ty=${tyi}`);
+                if (!res.ok) throw new Error(`Canvas tile fetch failed: ${res.status}`);
+                const blob = await res.blob();
                 const img = new Image();
-                img.src = response.data.image;
+                const objectUrl = URL.createObjectURL(blob);
+                img.src = objectUrl;
                 await img.decode();
                 const sx = txi === startTileX ? startX - txi * TILE_SIZE : 0;
                 const sy = tyi === startTileY ? startY - tyi * TILE_SIZE : 0;
@@ -543,6 +648,7 @@ const fetchCanvas = async (txVal, tyVal, pxVal, pyVal, width, height) => {
                 const dx = txi * TILE_SIZE + sx - startX;
                 const dy = tyi * TILE_SIZE + sy - startY;
                 ctx.drawImage(img, sx, sy, sw, sh, dx, dy, sw, sh);
+                URL.revokeObjectURL(objectUrl);
             } catch (error) {
                 handleError(error);
                 return;
@@ -834,9 +940,10 @@ openManageUsers.addEventListener('click', () => {
             user.className = 'user';
             user.id = `user-${id}`;
 
+            const safeName = escapeHtml(String(users[id].name));
             user.innerHTML = `
                 <div class="user-info">
-                    <span>${users[id].name}</span>
+                    <span>${safeName}</span>
                     <span>(#${id})</span>
                     <div class="user-stats">
                         Charges: <b>?</b>/<b>?</b> | Level <b>?</b> <span class="level-progress">(?%)</span><br>
@@ -851,7 +958,7 @@ openManageUsers.addEventListener('click', () => {
             user.querySelector('.delete-btn').addEventListener('click', () => {
                 showConfirmation(
                     'Delete User',
-                    `Are you sure you want to delete ${users[id].name} (#${id})? This will also remove them from all templates.`,
+                    `Are you sure you want to delete ${safeName} (#${id})? This will also remove them from all templates.`,
                     async () => {
                         try {
                             await axios.delete(`/user/${id}`);
@@ -860,30 +967,48 @@ openManageUsers.addEventListener('click', () => {
                         } catch (error) {
                             handleError(error);
                         }
-                    }
+                    },
+                    true
                 );
             });
             user.querySelector('.info-btn').addEventListener('click', async () => {
                 try {
-                    const response = await axios.get(`/user/status/${id}`);
-                    const info = `
-                    <b>User Name:</b> <span style="color: #f97a1f;">${response.data.name}</span><br>
-                    <b>Charges:</b> <span style="color: #f97a1f;">${Math.floor(response.data.charges.count)}</span>/<span style="color: #f97a1f;">${response.data.charges.max}</span><br>
-                    <b>Droplets:</b> <span style="color: #f97a1f;">${response.data.droplets}</span><br>
-                    <b>Favorite Locations:</b> <span style="color: #f97a1f;">${response.data.favoriteLocations.length}</span>/<span style="color: #f97a1f;">${response.data.maxFavoriteLocations}</span><br>
-                    <b>Flag Equipped:</b> <span style="color: #f97a1f;">${response.data.equippedFlag ? 'Yes' : 'No'}</span><br>
-                    <b>Discord:</b> <span style="color: #f97a1f;">${response.data.discord}</span><br>
-                    <b>Country:</b> <span style="color: #f97a1f;">${response.data.country}</span><br>
-                    <b>Pixels Painted:</b> <span style="color: #f97a1f;">${response.data.pixelsPainted}</span><br>
-                    <b>Extra Colors:</b> <span style="color: #f97a1f;">${response.data.extraColorsBitmap}</span><br>
-                    <b>Alliance ID:</b> <span style="color: #f97a1f;">${response.data.allianceId}</span><br>
-                    <b>Alliance Role:</b> <span style="color: #f97a1f;">${response.data.allianceRole}</span><br>
-                    <br>Would you like to copy the <b>Raw Json</b> to your clipboard?
-                    `;
+                    const response = await axiosGetWithRetry(`/user/status/${id}`, 3, 2000);
+                    let { status: isBanned, until } = response.data.ban;
+                    let info;
+                    if (isBanned == true) {
+                        if (until == Number.MAX_SAFE_INTEGER)
+                            until = "FOREVER";
+                        else
+                            until = new Date(until);
+
+                        const safeBannedName = escapeHtml(String(response.data.name));
+                        const safeUntil = escapeHtml(String(until));
+                        info = `
+                        User <b><span style="color: #f97a1f;">${safeBannedName}</span></b> has been <span style="color: #b91919ff;">banned!</span><br>
+                        <b>Banned until:</n> <span style="color: #f97a1f;">${safeUntil}</span><br>
+                        <br>Would you like to remove the <b>account</b> from the user list?
+                        `
+                    } else
+                        info = `
+                        <b>User Name:</b> <span style="color: #f97a1f;">${escapeHtml(String(response.data.name))}</span><br>
+                        <b>Charges:</b> <span style="color: #f97a1f;">${Math.floor(response.data.charges.count)}</span>/<span style="color: #f97a1f;">${response.data.charges.max}</span><br>
+                        <b>Droplets:</b> <span style="color: #f97a1f;">${escapeHtml(String(response.data.droplets))}</span><br>
+                        <b>Favorite Locations:</b> <span style="color: #f97a1f;">${response.data.favoriteLocations.length}</span>/<span style="color: #f97a1f;">${response.data.maxFavoriteLocations}</span><br>
+                        <b>Flag Equipped:</b> <span style="color: #f97a1f;">${response.data.equippedFlag ? 'Yes' : 'No'}</span><br>
+                        <b>Discord:</b> <span style="color: #f97a1f;">${escapeHtml(String(response.data.discord))}</span><br>
+                        <b>Country:</b> <span style="color: #f97a1f;">${escapeHtml(String(response.data.country))}</span><br>
+                        <b>Pixels Painted:</b> <span style="color: #f97a1f;">${escapeHtml(String(response.data.pixelsPainted))}</span><br>
+                        <b>Extra Colors:</b> <span style="color: #f97a1f;">${escapeHtml(String(response.data.extraColorsBitmap))}</span><br>
+                        <b>Alliance ID:</b> <span style="color: #f97a1f;">${escapeHtml(String(response.data.allianceId))}</span><br>
+                        <b>Alliance Role:</b> <span style="color: #f97a1f;">${escapeHtml(String(response.data.allianceRole))}</span><br>
+                        <br>Would you like to copy the <b>Raw Json</b> to your clipboard?
+                        `;
 
                     showConfirmation('User Info', info, () => {
-                        navigator.clipboard.writeText(JSON.stringify(response.data, null, 2));
-                    });
+                        if (isBanned) user.querySelector('.delete-btn').click();
+                        else navigator.clipboard.writeText(JSON.stringify(response.data, null, 2));
+                    }, !isBanned);
                 } catch (error) {
                     handleError(error);
                 }
@@ -924,7 +1049,7 @@ checkUserStatus.addEventListener('click', async () => {
             const dropletsEl = userEl.querySelector('.user-stats b:nth-of-type(4)');
             const levelProgressEl = userEl.querySelector('.level-progress');
 
-            if (status && status.success) {
+            if (status && status.success && status.data.ban.status == false) {
                 const userInfo = status.data;
                 const charges = Math.floor(userInfo.charges.count);
                 const max = userInfo.charges.max;
@@ -1112,11 +1237,11 @@ const createTemplateCard = (t, id) => {
     shareBtn.className = 'secondary-button';
     shareBtn.innerHTML = '<img src="icons/open.svg">Share';
     shareBtn.addEventListener('click', async () => {
-        if (!t.shareCode) {
+        if (!t.template.shareCode) {
             showMessage('Error', 'No share code available for this template.');
             return;
         }
-        await navigator.clipboard.writeText(t.shareCode);
+        await navigator.clipboard.writeText(t.template.shareCode);
         showMessage('Copied!', 'Share code copied to clipboard.');
     });
     actions.appendChild(shareBtn);
@@ -1160,7 +1285,7 @@ const createTemplateCard = (t, id) => {
             } catch (e) {
                 handleError(e);
             }
-        });
+        }, true);
     });
     actions.appendChild(delBtn);
     card.appendChild(actions);

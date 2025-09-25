@@ -4,7 +4,8 @@ const COOKIE_ALARM_NAME = 'wplacer-cookie-alarm';
 
 // --- Core Functions ---
 const getSettings = async () => {
-    const result = await chrome.storage.local.get(['wplacerPort']);
+    let result = {};
+    try { result = await chrome.storage.local.get(['wplacerPort']); } catch {}
     return {
         port: result.wplacerPort || 80,
         host: '127.0.0.1'
@@ -61,30 +62,28 @@ const sendCookie = async (callback) => {
     const getCookie = (details) => new Promise(resolve => chrome.cookies.get(details, cookie => resolve(cookie)));
 
     const [jCookie, sCookie] = await Promise.all([
-        getCookie({ url: "https://backend.wplace.live", name: "j" }),
-        getCookie({ url: "https://backend.wplace.live", name: "s" })
+        getCookie({ url: 'https://backend.wplace.live', name: 'j' }),
+        getCookie({ url: 'https://backend.wplace.live', name: 's' }),
     ]);
 
-    if (!jCookie) {
-        if (callback) callback({ success: false, error: "Cookie 'j' not found. Are you logged in?" });
-        return;
-    }
+    if (!jCookie) return { success: false, error: "Cookie 'j' not found. Are you logged in?" };
 
     const cookies = { j: jCookie.value };
     if (sCookie) cookies.s = sCookie.value;
-    const url = await getServerUrl("/user");
+    const url = await getServerUrl('/user');
 
     try {
         const response = await fetch(url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ cookies, expirationDate: jCookie.expirationDate })
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cookies, expirationDate: jCookie.expirationDate }),
         });
         if (!response.ok) throw new Error(`Server responded with status: ${response.status}`);
+        /** @type {{ name: string; }} */
         const userInfo = await response.json();
-        if (callback) callback({ success: true, name: userInfo.name });
+        callback?.({ success: true, name: userInfo.name });
     } catch (error) {
-        if (callback) callback({ success: false, error: "Could not connect to the wplacer server." });
+        callback?.({ success: false, error: 'Could not connect to the wplacer server.' });
     }
 };
 
@@ -133,118 +132,74 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     world: 'MAIN',
                     func: () => {
                         if (window.__wplacerPawtectHooked) return;
-                        window.__wplacerPawtectHooked = true;
+                        Object.defineProperty(window, "__wplacerPawtectHooked", { value: true, writable: false });
 
                         // Find by object value, not by file name
                         window.__wplacerPawtectModule = (async () => {
-                            /** @typedef {{ type: "function" | "class" | "variable"; instanceResult: never; found: boolean; filterFunction: (obj: unknown, modules: Record<string, unknown>) => Promise<boolean>; readonly value: unknown; globalInstance: unknown }} Hook */
-
-                            /**
-                             * Create a hook filter that will get use for find the object
-                             * @author Hao1337
-                             * @param {(this: Hook, obj: unknown, modules: Record<string, unknown>) => boolean} filterFunction - The function that use to find the request module. Can't use the function/class/variable name since it get change every time the web have rebuild. But the property name stay the same at all!
-                             * @param {"class"|"variable"|"function"} type - Value type
-                             * @returns {Hook}
-                             */
-                            function createHook(filterFunction = () => false, type = 'class') {
-                                const hookObj = {
-                                    type,
-                                    instanceResult: void 0,
-                                    found: false,
-                                    globalInstance: void 0,
-                                    /** @type {unknown} */
-                                    get value() {
-                                        if (!this.instanceResult) return void 0;
-                                        if (this.type === 'class') {
-                                            return typeof this.instanceResult === 'function'
-                                                ? this.instanceResult
-                                                : Object.getPrototypeOf(this.instanceResult);
-                                        }
-                                        return this.instanceResult;
-                                    },
-                                };
-                                hookObj.filterFunction = filterFunction.bind(hookObj);
-                                return hookObj;
-                            }
-
-                            /**
-                             * Find the script base on the hook options
-                             * @author Hao1337
-                             * @param {Hook[]} hooksInfo
-                             * @returns {Promise<unknown[]>} - The module that you want to find, module order like input hook order
-                             */
-                            async function findScriptModuleRecusive(hooksInfo = []) {
-                                const scripts = performance.getEntriesByType('resource').filter((r) => r.initiatorType === 'script');
-                                const out = Array.from({ length: hooksInfo.length }).fill(void 0);
+                            try {
+                                const scripts = performance.getEntriesByType("resource")
+                                    .filter(r => r.initiatorType === "script");
 
                                 for (const script of scripts) {
                                     try {
                                         const module = await import(script.name);
-                                        const moduleAsObject = Object.entries(module);
-
-                                        for (const [exportName, exportValue] of moduleAsObject) {
-                                            for (let i = 0; i < hooksInfo.length; i++) {
-                                                const found = await hooksInfo[i].filterFunction(exportValue, moduleAsObject);
-                                                if (found && !hooksInfo[i].found) {
-                                                    hooksInfo[i].instanceResult = exportValue;
-                                                    hooksInfo[i].found = true;
-                                                    out[i] = module;
-                                                    console.log(`wplacer: Hook matched on ${exportName} from ${script.name}`, out);
-                                                }
-                                            }
+                                        if ("_" in module && typeof module._ === "function") {
+                                            const funcStr = module._.toString();
+                                            if (/get_pawtected_endpoint_payload/.test(funcStr) || /pawtect_wasm_bg\.wasm/.test(funcStr)) {
+                                                console.log("wplacer: found pawtect module in", script.name);
+                                                return module;
+                                            };
                                         }
-                                    } catch (err) {
-                                        console.warn('wplacer: Could not import', script.name, err);
+                                    } catch (e) {
+                                        console.warn("wplacer: failed to import", script.name, e);
                                     }
                                 }
-
-                                return out;
+                            } catch (err) {
+                                console.error("wplacer: module scan failed", err);
                             }
-
-                            const pawTectHook = createHook(function FindPaintFunction(obj) {
-                                if (!obj || typeof obj !== 'object') return false;
-                                return 'paint' in obj && 'url' in obj && typeof obj['paint'] === 'function';
-                            }, 'variable');
-
-                            return await findScriptModuleRecusive([pawTectHook])
-                                .then(r => r?.[0] ?? null)
-                                .catch(console.error) ?? null;
+                            return null; // important! never leave unresolved
                         })();
 
                         const backend = 'https://backend.wplace.live';
                         const computePawtect = async (url, bodyStr) => {
                             const mod = typeof window.__wplacerPawtectModule === "undefined" ? null : await window.__wplacerPawtectModule;
                             if (!mod || typeof mod._ !== 'function') return null;
-                            const wasm = await mod._();
+                            let wasm = await mod._();
                             try {
                                 const me = await fetch(`${backend}/me`, { credentials: 'include' }).then(r => r.ok ? r.json() : null);
                                 if (me?.id && typeof mod.i === 'function') mod.i(me.id);
-                            } catch {}
+                            } catch { }
                             if (typeof mod.r === 'function') mod.r(url);
                             const enc = new TextEncoder();
                             const dec = new TextDecoder();
                             const bytes = enc.encode(bodyStr);
                             const inPtr = wasm.__wbindgen_malloc(bytes.length, 1);
-                            new Uint8Array(wasm.memory.buffer, inPtr, bytes.length).set(bytes);
-                            console.log('wplacer: pawtect compute start', { url, bodyLen: bodyStr.length });
-                            const out = wasm.get_pawtected_endpoint_payload(inPtr, bytes.length);
-                            let token;
-                            if (Array.isArray(out)) {
-                                const [outPtr, outLen] = out;
-                                token = dec.decode(new Uint8Array(wasm.memory.buffer, outPtr, outLen));
-                                try { wasm.__wbindgen_free(outPtr, outLen, 1); } catch {}
-                            } else if (typeof out === 'string') {
-                                token = out;
-                            } else if (out && typeof out.ptr === 'number' && typeof out.len === 'number') {
-                                token = dec.decode(new Uint8Array(wasm.memory.buffer, out.ptr, out.len));
-                                try { wasm.__wbindgen_free(out.ptr, out.len, 1); } catch {}
-                            } else {
-                                console.warn('wplacer: unexpected pawtect out shape', typeof out);
-                                token = null;
+                            try {
+                                new Uint8Array(wasm.memory.buffer, inPtr, bytes.length).set(bytes);
+                                if (typeof mod.r === "function") mod.r(url);
+
+                                const out = wasm.get_pawtected_endpoint_payload(inPtr, bytes.length);
+
+                                let token = null;
+                                if (Array.isArray(out)) {
+                                    const [outPtr, outLen] = out;
+                                    token = dec.decode(new Uint8Array(wasm.memory.buffer, outPtr, outLen));
+                                    wasm.__wbindgen_free(outPtr, outLen, 1);
+                                } else if (typeof out === "string") {
+                                    token = out;
+                                } else if (out && typeof out.ptr === "number" && typeof out.len === "number") {
+                                    token = dec.decode(new Uint8Array(wasm.memory.buffer, out.ptr, out.len));
+                                    wasm.__wbindgen_free(out.ptr, out.len, 1);
+                                }
+                                window.postMessage({ type: "WPLACER_PAWTECT_TOKEN", token, origin: "pixel" }, "*");
+                                return token;
+                            } catch (err) {
+                                console.error("wplacer: computePawtect error", err);
+                                return null;
+                            } finally {
+                                try { wasm.__wbindgen_free(inPtr, bytes.length, 1); } catch {}
+                                wasm = null;
                             }
-                            console.log('wplacer: pawtect compute done, tokenLen:', token ? token.length : 0);
-                            window.postMessage({ type: 'WPLACER_PAWTECT_TOKEN', token, origin: 'pixel' }, '*');
-                            return token;
                         };
 
                         const originalFetch = window.fetch.bind(window);
@@ -265,24 +220,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                                             const text = await clone.text();
                                             console.log('wplacer: hook(fetch) pixel POST detected (clone)', req.url, 'len', text.length);
                                             computePawtect(req.url, text);
-                                        } catch {}
+                                        } catch { }
                                     }
                                 }
-                            } catch {}
+                            } catch { }
                             return originalFetch(...args);
                         };
                         // Also hook XHR in case the site uses XMLHttpRequest
                         try {
                             const origOpen = XMLHttpRequest.prototype.open;
                             const origSend = XMLHttpRequest.prototype.send;
-                            XMLHttpRequest.prototype.open = function(method, url) {
+                            XMLHttpRequest.prototype.open = function (method, url) {
                                 try {
                                     this.__wplacer_url = new URL(url, location.href).href;
                                     this.__wplacer_method = String(method || '');
-                                } catch {}
+                                } catch { }
                                 return origOpen.apply(this, arguments);
                             };
-                            XMLHttpRequest.prototype.send = function(body) {
+                            XMLHttpRequest.prototype.send = function (body) {
                                 try {
                                     if ((this.__wplacer_method || '').toUpperCase() === 'POST' && /\/s0\/pixel\//.test(this.__wplacer_url || '')) {
                                         const url = this.__wplacer_url;
@@ -291,19 +246,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                                             console.log('wplacer: hook(XHR) pixel POST detected (string)', url, 'len', body.length);
                                             maybeCompute(body);
                                         } else if (body instanceof ArrayBuffer) {
-                                            try { const s = new TextDecoder().decode(new Uint8Array(body)); console.log('wplacer: hook(XHR) pixel POST detected (ArrayBuffer)', url, 'len', s.length); maybeCompute(s); } catch {}
+                                            try { const s = new TextDecoder().decode(new Uint8Array(body)); console.log('wplacer: hook(XHR) pixel POST detected (ArrayBuffer)', url, 'len', s.length); maybeCompute(s); } catch { }
                                         } else if (body && typeof body === 'object' && 'buffer' in body && body.buffer instanceof ArrayBuffer) {
                                             // e.g., Uint8Array
-                                            try { const s = new TextDecoder().decode(new Uint8Array(body.buffer)); console.log('wplacer: hook(XHR) pixel POST detected (TypedArray)', url, 'len', s.length); maybeCompute(s); } catch {}
+                                            try { const s = new TextDecoder().decode(new Uint8Array(body.buffer)); console.log('wplacer: hook(XHR) pixel POST detected (TypedArray)', url, 'len', s.length); maybeCompute(s); } catch { }
                                         } else if (body && typeof body.text === 'function') {
                                             // Blob or similar
-                                            try { body.text().then(s => { console.log('wplacer: hook(XHR) pixel POST detected (Blob)', url, 'len', (s||'').length); maybeCompute(s); }).catch(() => {}); } catch {}
+                                            try { body.text().then(s => { console.log('wplacer: hook(XHR) pixel POST detected (Blob)', url, 'len', (s || '').length); maybeCompute(s); }).catch(() => { }); } catch { }
                                         }
                                     }
-                                } catch {}
+                                } catch { }
                                 return origSend.apply(this, arguments);
                             };
-                        } catch {}
+                        } catch { }
                         console.log('wplacer: pawtect fetch hook installed');
                     }
                 });
@@ -326,12 +281,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                             try {
                                 const backend = 'https://backend.wplace.live';
                                 const url = `${backend}/s0/pixel/1/1`;
-                                const mod = typeof window.__wplacerPawtectModule === "undefined" ? null : await window.__wplacerPawtectModule;
+                                const mod = await import('/_app/immutable/chunks/BBb1ALhY.js');
                                 const wasm = await mod._();
                                 try {
                                     const me = await fetch(`${backend}/me`, { credentials: 'include' }).then(r => r.ok ? r.json() : null);
                                     if (me?.id && typeof mod.i === 'function') mod.i(me.id);
-                                } catch {}
+                                } catch { }
                                 if (typeof mod.r === 'function') mod.r(url);
                                 const enc = new TextEncoder();
                                 const dec = new TextDecoder();
@@ -343,28 +298,30 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                                 if (Array.isArray(out)) {
                                     const [outPtr, outLen] = out;
                                     token = dec.decode(new Uint8Array(wasm.memory.buffer, outPtr, outLen));
-                                    try { wasm.__wbindgen_free(outPtr, outLen, 1); } catch {}
+                                    try { wasm.__wbindgen_free(outPtr, outLen, 1); } catch { }
                                 } else if (typeof out === 'string') {
                                     token = out;
                                 } else if (out && typeof out.ptr === 'number' && typeof out.len === 'number') {
                                     token = dec.decode(new Uint8Array(wasm.memory.buffer, out.ptr, out.len));
-                                    try { wasm.__wbindgen_free(out.ptr, out.len, 1); } catch {}
+                                    try { wasm.__wbindgen_free(out.ptr, out.len, 1); } catch { }
                                 }
+                                try { wasm.__wbindgen_free(inPtr, bytes.length, 1); } catch {}
+                                wasm = null;
                                 window.postMessage({ type: 'WPLACER_PAWTECT_TOKEN', token, origin: 'seed' }, '*');
-                            } catch {}
+                            } catch { }
                         })();
                     },
                     args: [bodyStr]
                 });
             }
-        } catch {}
+        } catch { }
         sendResponse({ ok: true });
         return true;
     }
     if (request.action === 'computePawtectForT') {
         try {
             if (sender.tab?.id) {
-                const turnstile = typeof request.bodyStr === 'string' ? (()=>{ try { return JSON.parse(request.bodyStr).t || ''; } catch { return ''; } })() : '';
+                const turnstile = typeof request.bodyStr === 'string' ? (() => { try { return JSON.parse(request.bodyStr).t || ''; } catch { return ''; } })() : '';
                 chrome.scripting.executeScript({
                     target: { tabId: sender.tab.id },
                     world: 'MAIN',
@@ -372,21 +329,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         (async () => {
                             try {
                                 const backend = 'https://backend.wplace.live';
-                                const mod = typeof window.__wplacerPawtectModule === "undefined" ? null : await window.__wplacerPawtectModule;
+                                const mod = await import('/_app/immutable/chunks/BBb1ALhY.js');
                                 const wasm = await mod._();
                                 try {
                                     const me = await fetch(`${backend}/me`, { credentials: 'include' }).then(r => r.ok ? r.json() : null);
                                     if (me?.id && typeof mod.i === 'function') mod.i(me.id);
-                                } catch {}
+                                } catch { }
                                 // Randomize pixel tile minimally (fixed 1/1) and coords for simplicity
                                 const url = `${backend}/s0/pixel/1/1`;
                                 if (typeof mod.r === 'function') mod.r(url);
-                                const fp = (window.wplacerFP && String(window.wplacerFP)) || (()=>{
-                                    const b = new Uint8Array(16); crypto.getRandomValues(b); return Array.from(b).map(x=>x.toString(16).padStart(2,'0')).join('');
+                                const fp = (window.wplacerFP && String(window.wplacerFP)) || (() => {
+                                    const b = new Uint8Array(16); crypto.getRandomValues(b); return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
                                 })();
-                                const rx = Math.floor(Math.random()*1000);
-                                const ry = Math.floor(Math.random()*1000);
-                                const bodyObj = { colors:[0], coords:[rx,ry], fp, t: String(tValue||'') };
+                                const rx = Math.floor(Math.random() * 1000);
+                                const ry = Math.floor(Math.random() * 1000);
+                                const bodyObj = { colors: [0], coords: [rx, ry], fp, t: String(tValue || '') };
                                 const rawBody = JSON.stringify(bodyObj);
                                 const enc = new TextEncoder();
                                 const dec = new TextDecoder();
@@ -398,21 +355,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                                 if (Array.isArray(out)) {
                                     const [outPtr, outLen] = out;
                                     token = dec.decode(new Uint8Array(wasm.memory.buffer, outPtr, outLen));
-                                    try { wasm.__wbindgen_free(outPtr, outLen, 1); } catch {}
+                                    try { wasm.__wbindgen_free(outPtr, outLen, 1); } catch { }
                                 } else if (typeof out === 'string') {
                                     token = out;
                                 } else if (out && typeof out.ptr === 'number' && typeof out.len === 'number') {
                                     token = dec.decode(new Uint8Array(wasm.memory.buffer, out.ptr, out.len));
-                                    try { wasm.__wbindgen_free(out.ptr, out.len, 1); } catch {}
+                                    try { wasm.__wbindgen_free(out.ptr, out.len, 1); } catch { }
                                 }
+                                try { wasm.__wbindgen_free(inPtr, bytes.length, 1); } catch {}
+                                wasm = null;
                                 window.postMessage({ type: 'WPLACER_PAWTECT_TOKEN', token, origin: 'simple' }, '*');
-                            } catch {}
+                            } catch { }
                         })();
                     },
                     args: [turnstile]
                 });
             }
-        } catch {}
+        } catch { }
         sendResponse({ ok: true });
         return true;
     }
